@@ -1,0 +1,30 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- IDE / 编辑器 ----
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ---- 系统文件 ----
+.DS_Store
+Thumbs.db
+
+# ---- 日志 / 临时文件 ----
+*.log
+*.tmp
+*.bak
+
+# ---- 测试与运行产物 ----
+# 串口调试脚本若不想入库，可在此取消注释
+# debug_display.py
