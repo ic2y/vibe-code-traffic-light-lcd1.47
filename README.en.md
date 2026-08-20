@@ -238,16 +238,6 @@ In either case the `settings.json` content is the same:
 
 2. Restart Claude Code (or start a new session) for the hooks to take effect.
 
-### Notes
-
-- `type: "command"`: the hook is executed as a shell command.
-- `command`: uses Node's built-in `fetch` to call the LED turn-on endpoint (available in Node 18+, no extra dependencies). `127.0.0.1:15000` is the default local listen address; change it to the server IP when used remotely.
-- `async: true`: runs asynchronously, so it never blocks the normal Claude Code flow and its output is not shown in the UI.
-- `.catch(()=>{})`: swallows request errors — the hook won't fail even if the LED service is not running.
-- Prerequisites: the LED service must be running locally (`python http_server.py`).
-- If you used Option 1 but the hooks don't fire, confirm the current session's working directory is this project root; restart Claude Code (or start a new session) after changing the config so it gets reloaded.
-- When both configs exist, the project-level one takes precedence — it overrides same-name hooks in the user-level config.
-
 ## OpenCode Plugin (LED Status Light)
 
 OpenCode loads plugins from the `~/.config/opencode/plugins/` directory. The plugin below turns the left-side (OP) red/green light into a "working status" indicator:
@@ -282,13 +272,58 @@ export const LedNotifyPlugin = async () => {
 
 Restart OpenCode (or start a new session) for the plugin to take effect.
 
-### Notes
+## CommandCode Mod (LED Status Light)
 
-- `chat.message`: fires on every message you send — lights the left red light.
-- `event`: subscribes to OpenCode session events; `session.idle` means the round is over — lights the left green light.
-- The address `192.168.250.225:15000` is an example remote address; change it to your actual LED service address (use `127.0.0.1:15000` for local deployment).
-- `try/catch` silently swallows request failures — the plugin won't error even if the LED service is not running.
-- Complements the Claude Code hooks: left (OP) drives OpenCode, right (CC) drives Claude Code — you can use both at the same time.
+[commandcode.ai](https://commandcode.ai) loads **mods** from the `~/.commandcode/mods/` directory. The mod below turns the left-side (OP) red/green light into a "working status" indicator:
+
+- **When you send a message** (`transformInput`) → left red light turns on (CommandCode is working)
+- **When a round finishes** (`onRunEnd`) → left green light turns on (this round is done)
+- **Optional: when a session starts** (`onSessionStart`) → left green light turns on (just entered a session)
+
+### Setup
+
+```bash
+mkdir ~/.commandcode/mods
+vim ~/.commandcode/mods/led-notify.ts
+```
+
+Enter the following content:
+
+```ts
+import type { ModApi } from '@commandcode/harness';
+
+const LED_BASE = 'http://192.168.250.225:15000/led/left';
+
+async function setLed(color: 'red' | 'green') {
+  try {
+    await fetch(`${LED_BASE}/${color}/on`);
+  } catch {
+    // Ignore network errors so the agent is not affected
+  }
+}
+
+export default function (cmd: ModApi) {
+  cmd.hooks({
+    // user sends a message → red light (closest to OpenCode's chat.message)
+    transformInput: async () => {
+      await setLed('red');
+      return undefined; // do not rewrite the input
+    },
+
+    // round finished (session idle) → green light
+    onRunEnd: async () => {
+      await setLed('green');
+    },
+
+    // optional: also light green when a session starts
+    onSessionStart: async () => {
+      await setLed('green');
+    },
+  });
+}
+```
+
+Restart CommandCode (or start a new session) for the mod to take effect.
 
 ## Tests
 

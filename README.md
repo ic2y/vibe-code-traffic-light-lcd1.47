@@ -238,16 +238,6 @@ Claude Code 支持通过 `.claude/settings.json` 配置 **Hook**，在特定事�
 
 2. 保存后重启 Claude Code（或新开会话）使 Hook 生效。
 
-### 说明
-
-- `type: "command"`：以 shell 命令形式执行 Hook。
-- `command`：用 Node 内置的 `fetch` 请求 LED 点亮接口（Node 18+ 自带，无需额外依赖）。`127.0.0.1:15000` 是本机默认监听地址，远程使用时改成服务器 IP。
-- `async: true`：异步执行，不阻塞 Claude Code 正常流程，也不会把输出展示到界面。
-- `.catch(()=>{})`：吞掉请求失败的错误——即使 LED 服务没启动，Hook 也不会报错。
-- 生效前提：LED 服务已在本机运行（`python http_server.py`）。
-- 若采用"方式一"但 Hook 不生效，先确认当前会话的工作目录就是该项目根目录；改了配置后需重启 Claude Code（或新开会话）才会加载。
-- 两处配置都存在时，项目级配置优先，用户级配置中的同名 Hook 会被项目级覆盖。
-
 ## OpenCode 插件（LED 状态灯）
 
 OpenCode 支持在 `~/.config/opencode/plugins/` 目录下放插件文件。下面的插件让左侧（OP）红绿灯充当"工作状态灯"：
@@ -282,13 +272,58 @@ export const LedNotifyPlugin = async () => {
 
 保存后重启 OpenCode（或新开会话）使插件生效。
 
-### 说明
+## CommandCode Mod（LED 状态灯）
 
-- `chat.message`：每次用户发送消息时触发，点亮左侧红灯。
-- `event`：订阅 OpenCode 会话事件，`session.idle` 表示整轮对话结束，点亮左侧绿灯。
-- 地址 `192.168.250.225:15000` 为示例远程地址，按实际 LED 服务地址修改（本机部署用 `127.0.0.1:15000`）。
-- `try/catch` 静默吞掉请求失败——LED 服务未启动时插件也不会报错。
-- 与 Claude Code Hook 互补：左侧（OP）对应 OpenCode，右侧（CC）对应 Claude Code，可同时使用。
+[commandcode.ai](https://commandcode.ai) 支持在 `~/.commandcode/mods/` 目录下放 **Mod** 文件。下面的 Mod 让左侧（OP）红绿灯充当"工作状态灯"：
+
+- **收到用户消息时**（`transformInput`）→ 左红灯亮（CommandCode 工作中）
+- **整轮结束时**（`onRunEnd`）→ 左绿灯亮（本轮工作完成）
+- **可选：会话开始时**（`onSessionStart`）→ 左绿灯亮（刚进入会话）
+
+### 配置步骤
+
+```bash
+mkdir ~/.commandcode/mods
+vim ~/.commandcode/mods/led-notify.ts
+```
+
+输入如下内容：
+
+```ts
+import type { ModApi } from '@commandcode/harness';
+
+const LED_BASE = 'http://192.168.250.225:15000/led/left';
+
+async function setLed(color: 'red' | 'green') {
+  try {
+    await fetch(`${LED_BASE}/${color}/on`);
+  } catch {
+    // 忽略网络错误，避免影响 agent
+  }
+}
+
+export default function (cmd: ModApi) {
+  cmd.hooks({
+    // 用户发消息时 → 红灯（最接近 OpenCode 的 chat.message）
+    transformInput: async () => {
+      await setLed('red');
+      return undefined; // 不改写输入
+    },
+
+    // 整轮结束（session idle）→ 绿灯
+    onRunEnd: async () => {
+      await setLed('green');
+    },
+
+    // 可选：会话开始也亮绿灯
+    onSessionStart: async () => {
+      await setLed('green');
+    },
+  });
+}
+```
+
+保存后重启 CommandCode（或新开会话）使 Mod 生效。
 
 ## 测试
 
