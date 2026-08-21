@@ -10,10 +10,10 @@ LED 显示屏 HTTP 服务（重构版）
 左右两个区域相互独立。
 
 对外 API：
-    GET /led/left/green/on    左绿亮
+    GET /led/left/green/on    左绿亮（后台播放 music/ring.mp3 响铃）
     GET /led/left/red/on      左红亮
     GET /led/right/red/on     右红亮
-    GET /led/right/green/on   右绿亮
+    GET /led/right/green/on   右绿亮（后台播放 music/ring.mp3 响铃）
     GET /led/all/off          左右全部熄灭（辅助接口）
     GET /status               查询当前左右状态
     GET /health               健康检查
@@ -21,11 +21,19 @@ LED 显示屏 HTTP 服务（重构版）
 运行：
     python http_server.py                  # 连接真实显示屏（串口）
     LED_SIMULATE=1 python http_server.py   # 模拟模式，无需硬件，便于联调/测试
+    LED_MUTE=1  python http_server.py      # 始终静音（不响铃）
+    python http_server.py --sound          # 始终响铃（忽略午休静音窗口）
+    python http_server.py --mute-window 13:00-14:30   # 自定义静音窗口
+    # 不设静音参数时默认：12:30-14:00 之间静音，其余时间响铃
 
 监听地址与端口可通过环境变量覆盖：LED_HOST / LED_PORT
 """
+import argparse
 import os
+import platform
 import re
+import shutil
+import subprocess
 import threading
 import time
 from typing import Dict, Optional, Tuple
@@ -80,6 +88,135 @@ FONT_5X7 = {
 SIMULATE = os.environ.get("LED_SIMULATE", "0").lower() in ("1", "true", "yes")
 HOST = os.environ.get("LED_HOST", "0.0.0.0")
 PORT = int(os.environ.get("LED_PORT", "15000"))
+
+# ============ 铃声配置 ============
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RING_MP3 = os.path.join(BASE_DIR, "music", "ring.mp3")
+RING_COOLDOWN = 1.0  # 秒；两次响铃最小间隔，避免并发请求导致铃声叠加
+
+# 静音模式：always=始终静音, never=始终响铃, auto=仅午休静音窗口内静音
+# 默认 auto（不设 LED_MUTE 也不传 --mute/--sound 时生效）
+MUTE_MODE = "auto"
+_led_mute = os.environ.get("LED_MUTE", "").strip().lower()
+if _led_mute in ("1", "true", "always", "on", "yes"):
+    MUTE_MODE = "always"
+elif _led_mute in ("0", "false", "never", "off", "no"):
+    MUTE_MODE = "never"
+
+def _parse_window(s: str) -> Tuple[int, int]:
+    """解析 HH:MM-HH:MM 为分钟数元组 (start, end)"""
+    start_s, end_s = s.split("-", 1)
+    sh, sm = map(int, start_s.split(":"))
+    eh, em = map(int, end_s.split(":"))
+    return (sh * 60 + sm, eh * 60 + em)
+
+
+# 午休静音窗口（分钟数），默认 12:30-14:00；
+# 可用 LED_MUTE_WINDOW="HH:MM-HH:MM" 或 --mute-window HH:MM-HH:MM 覆盖
+MUTE_WINDOW = (12 * 60 + 30, 14 * 60)
+_window = os.environ.get("LED_MUTE_WINDOW", "").strip()
+if _window:
+    try:
+        MUTE_WINDOW = _parse_window(_window)
+    except ValueError:
+        print(f"[铃声] LED_MUTE_WINDOW 格式应为 HH:MM-HH:MM，已忽略: {_window}")
+
+
+def _fmt_window(w: Tuple[int, int]) -> str:
+    return f"{w[0] // 60:02d}:{w[0] % 60:02d}-{w[1] // 60:02d}:{w[1] % 60:02d}"
+
+
+def is_muted() -> bool:
+    """当前是否处于静音状态"""
+    if MUTE_MODE == "always":
+        return True
+    if MUTE_MODE == "never":
+        return False
+    now = time.localtime()
+    minutes = now.tm_hour * 60 + now.tm_min
+    start, end = MUTE_WINDOW
+    if start <= end:
+        return start <= minutes < end
+    return minutes >= start or minutes < end  # 跨零点窗口（如 22:00-06:00）
+
+
+class RingPlayer:
+    """跨平台后台播放铃声（仅用标准库，不阻塞 HTTP 请求）
+
+    Windows：WAV 用 winsound；MP3 用 PowerShell 调 Windows Media Player 静默播放，不弹窗口。
+    Linux：依次尝试 mpg123 / ffplay / mpv / cvlc / mplayer / play(sox)。
+    """
+
+    LINUX_PLAYERS = (
+        ("mpg123", ["-q"]),
+        ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet"]),
+        ("mpv", ["--no-video", "--really-quiet"]),
+        ("cvlc", ["--play-and-exit", "--quiet"]),
+        ("mplayer", ["-really-quiet"]),
+        ("play", ["-q"]),
+    )
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self._last_played = 0.0
+
+    def play(self) -> bool:
+        """后台发起播放；文件缺失或处于冷却期内则不播放。返回是否实际发起播放。"""
+        if not os.path.exists(self.path):
+            return False
+        with self._lock:
+            now = time.monotonic()
+            if now - self._last_played < RING_COOLDOWN:
+                return False
+            self._last_played = now
+        try:
+            if platform.system() == "Windows":
+                self._play_windows()
+            else:
+                self._play_linux()
+            return True
+        except Exception as e:
+            print(f"[铃声] 播放异常: {e}")
+            return False
+
+    def _play_windows(self) -> None:
+        path = os.path.abspath(self.path)
+        if path.lower().endswith(".wav"):
+            import winsound
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return
+        # MP3：PowerShell + Windows Media Player COM 后台静默播放，播完自动退出，不弹窗口
+        url = "'" + path.replace("'", "''") + "'"
+        script = (
+            "$wmp=New-Object -ComObject WMPlayer.OCX;"
+            f"$wmp.URL={url};"
+            "Start-Sleep -Milliseconds 300;"
+            "while($wmp.PlayState -eq 3){Start-Sleep -Milliseconds 100};"
+            "$wmp.close()"
+        )
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    def _play_linux(self) -> None:
+        for exe, args in self.LINUX_PLAYERS:
+            player = shutil.which(exe)
+            if player:
+                subprocess.Popen(
+                    [player] + args + [self.path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                return
+        print("[铃声] 未找到可用的 MP3 播放器（mpg123/ffplay/mpv/cvlc/mplayer/play），请安装其一")
+
+
+ring_player = RingPlayer(RING_MP3)
 
 
 class MSU2LiteDisplay:
@@ -244,7 +381,7 @@ class LedController:
     """管理左右两个区域的红绿灯状态与渲染"""
 
     REFRESH_INTERVAL = 2.0  # 秒；周期性重绘，压制真实设备自动休眠/屏保
-    AUTO_OFF_TIMEOUT = 1800.0   # 秒；最后一次请求后 30 分钟无请求则自动全部熄灭
+    AUTO_OFF_TIMEOUT = 3600.0   # 秒；最后一次请求后 60 分钟无请求则自动全部熄灭
     AUTO_OFF_CHECK_INTERVAL = 5.0  # 秒；自动熄灭检查间隔
 
     def __init__(self, display):
@@ -424,6 +561,12 @@ def _turn_on(region: str, color: str):
     try:
         ctrl = _get_controller()
         ctrl.turn_on(region, color)
+        # 绿灯点亮时后台响铃（受静音配置约束）
+        if color == "green":
+            if is_muted():
+                print("[铃声] 处于静音状态，跳过响铃", flush=True)
+            elif not ring_player.play():
+                print(f"[铃声] 未播放（铃声文件缺失或播放器不可用）: {RING_MP3}", flush=True)
         state = ctrl.get_status()
         side = "左" if region == "left" else "右"
         color_cn = "红" if color == "red" else "绿"
@@ -501,11 +644,35 @@ def create_controller() -> LedController:
 
 
 def main():
-    global controller
+    global controller, MUTE_MODE, MUTE_WINDOW
+    parser = argparse.ArgumentParser(description="LED 显示屏 HTTP 服务")
+    parser.add_argument("--mute", action="store_true", help="始终静音，不播放铃声")
+    parser.add_argument("--sound", action="store_true", help="始终播放铃声，忽略午休静音窗口")
+    parser.add_argument("--mute-window", metavar="HH:MM-HH:MM",
+                        help="自定义静音窗口（默认 12:30-14:00，如 13:00-14:30）")
+    args = parser.parse_args()
+    if args.mute and args.sound:
+        parser.error("--mute 与 --sound 不能同时使用")
+    if args.mute:
+        MUTE_MODE = "always"
+    elif args.sound:
+        MUTE_MODE = "never"
+    if args.mute_window:
+        try:
+            MUTE_WINDOW = _parse_window(args.mute_window)
+        except ValueError:
+            parser.error(f"--mute-window 格式应为 HH:MM-HH:MM: {args.mute_window}")
+
     print("=" * 60)
     print("LED 显示屏 HTTP 服务")
     print("=" * 60)
     print(f"[初始化] 模式: {'模拟' if SIMULATE else '真实串口'}")
+    _mode_cn = {"always": "始终静音", "never": "始终响铃", "auto": "午休窗口静音"}
+    _ring_info = _mode_cn[MUTE_MODE]
+    if MUTE_MODE == "auto":
+        _ring_info += f"（{_fmt_window(MUTE_WINDOW)} 内静音）"
+    print(f"[铃声] 文件: {RING_MP3}")
+    print(f"[铃声] 策略: {_ring_info}")
     try:
         controller = create_controller()
         print("[OK] [初始化] 显示屏就绪\n")
