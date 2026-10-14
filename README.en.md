@@ -238,7 +238,7 @@ In either case the `settings.json` content is the same:
 
 2. Restart Claude Code (or start a new session) for the hooks to take effect.
 
-## OpenCode Plugin (LED Status Light)
+## OpenCode Plugin  v1 (LED Status Light)
 
 OpenCode loads plugins from the `~/.config/opencode/plugins/` directory. The plugin below turns the left-side (OP) red/green light into a "working status" indicator:
 
@@ -271,6 +271,54 @@ export const LedNotifyPlugin = async () => {
 ```
 
 Restart OpenCode (or start a new session) for the plugin to take effect.
+
+## OpenCode V2 plugin
+vim ~/.config/opencode/plugins/led-notify/index.js
+
+```
+import { Plugin } from "@opencode/plugin"
+
+const BASE = "http://192.168.250.105:15000"
+
+async function led(color) {
+  try {
+    await fetch(`${BASE}/led/left/${color}/on`, {
+      signal: AbortSignal.timeout(3000),
+    })
+  } catch {}
+}
+
+export default Plugin.define({
+  id: "led-notify",
+  async setup(ctx) {
+    const pending = new Set() // 已红灯、等整轮结束
+    const waiting = new Set() // 已在 wait 中
+
+    // 用户发消息 → 红灯
+    await ctx.session.hook("prompt", async (event) => {
+      const id = event.sessionID
+      if (!id) return
+      pending.add(id)
+      await led("red")
+    })
+
+    // 真正开始请求模型时再 wait（此时已 busy，会等到整轮 idle）
+    await ctx.session.hook("context", (event) => {
+      const id = event.sessionID
+      if (!id || !pending.has(id) || waiting.has(id)) return
+
+      pending.delete(id)
+      waiting.add(id)
+
+      void ctx.session
+        .wait({ sessionID: id })
+        .then(() => led("green"))
+        .finally(() => waiting.delete(id))
+    })
+  },
+})
+
+```
 
 ## CommandCode Mod (LED Status Light)
 
