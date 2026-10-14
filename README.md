@@ -238,7 +238,7 @@ Claude Code 支持通过 `.claude/settings.json` 配置 **Hook**，在特定事�
 
 2. 保存后重启 Claude Code（或新开会话）使 Hook 生效。
 
-## OpenCode 插件（LED 状态灯）
+## OpenCode V1 插件（LED 状态灯）
 
 OpenCode 支持在 `~/.config/opencode/plugins/` 目录下放插件文件。下面的插件让左侧（OP）红绿灯充当"工作状态灯"：
 
@@ -271,6 +271,55 @@ export const LedNotifyPlugin = async () => {
 ```
 
 保存后重启 OpenCode（或新开会话）使插件生效。
+
+## OpenCode V2 插件
+vim ~/.config/opencode/plugins/led-notify/index.js
+
+```
+import { Plugin } from "@opencode/plugin"
+
+const BASE = "http://192.168.250.105:15000"
+
+async function led(color) {
+  try {
+    await fetch(`${BASE}/led/left/${color}/on`, {
+      signal: AbortSignal.timeout(3000),
+    })
+  } catch {}
+}
+
+export default Plugin.define({
+  id: "led-notify",
+  async setup(ctx) {
+    const pending = new Set() // 已红灯、等整轮结束
+    const waiting = new Set() // 已在 wait 中
+
+    // 用户发消息 → 红灯
+    await ctx.session.hook("prompt", async (event) => {
+      const id = event.sessionID
+      if (!id) return
+      pending.add(id)
+      await led("red")
+    })
+
+    // 真正开始请求模型时再 wait（此时已 busy，会等到整轮 idle）
+    await ctx.session.hook("context", (event) => {
+      const id = event.sessionID
+      if (!id || !pending.has(id) || waiting.has(id)) return
+
+      pending.delete(id)
+      waiting.add(id)
+
+      void ctx.session
+        .wait({ sessionID: id })
+        .then(() => led("green"))
+        .finally(() => waiting.delete(id))
+    })
+  },
+})
+
+```
+
 
 ## CommandCode Mod（LED 状态灯）
 
